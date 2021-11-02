@@ -1,10 +1,12 @@
 package adventures.observable
 
 import adventures.observable.model.{PageId, PaginatedResult, SourceRecord, TargetRecord}
+import adventures.task.TaskAdventures
 import monix.eval.Task
-import monix.reactive.Observable
+import monix.reactive.{Observable, OverflowStrategy}
 
-import scala.concurrent.Future
+import scala.util.{Failure, Success, Try}
+import scala.concurrent.duration._
 
 /**
   * If elements from a list can be operated on synchronously as a List[A], then the equivalent data structure where
@@ -36,12 +38,25 @@ object ObservableAdventures {
     * What would you do if you needed back pressure (i.e. if something else consuming from the iterable slowed down, how
     * would this propagate?)
     */
-  def iterablesAndConcurrency(records: Iterable[Int], load: Int => Future[SourceRecord]): Iterable[TargetRecord] = ???
+  // def iterablesAndConcurrency(records: Iterable[Int], load: Int => Future[SourceRecord]): Iterable[TargetRecord] = ???
 
   /**
     * Create an Observable which emits each element of the source list
     */
-  def listToObservable(records: List[SourceRecord]): Observable[SourceRecord] = ???
+
+  // Observable.fromIterable converts any Iterable into an Observable:
+  //
+  // val obs = Observable.fromIterable(List(1, 2, 3))
+  //// obs: monix.reactive.Observable[Int] = IterableAsObservable@7b0e123d
+  //
+  // obs.foreachL(println).runToFuture
+  ////=> 1
+  ////=> 2
+  ////=> 3
+
+  def listToObservable(records: List[SourceRecord]): Observable[SourceRecord] = {
+    Observable.fromIterable(records)
+  }
 
   /**
     * Transform all of the SourceRecords to TargetRecords.  If the price cannot be converted to a double,
@@ -50,7 +65,14 @@ object ObservableAdventures {
     * @param sourceRecords
     * @return
     */
-  def transform(sourceRecords: Observable[SourceRecord]): Observable[TargetRecord] = ???
+  def transform(sourceRecords: Observable[SourceRecord]): Observable[TargetRecord] = {
+    sourceRecords.flatMap { source =>
+      Try(source.price.toDouble) match {
+        case Failure(_) => Observable.empty
+        case Success(price) => Observable(TargetRecord(source.id, price))
+      }
+    }
+  }
 
   /**
     * Elastic search supports saving batches of 5 records. This is a remote async call so the result is represented
@@ -59,7 +81,18 @@ object ObservableAdventures {
     * Implement the following method so it calls elasticSearchLoad with batches of 5 records and returns the number
     * of loaded items.
     */
-  def load(targetRecords: Observable[TargetRecord], elasticSearchLoad: Seq[TargetRecord] => Task[Unit]): Observable[Int] = ???
+
+  // Observable#bufferTumbling will gather elements and emit them in non-overlapping bundles of a specified count.
+  // It is essentially bufferSliding where count is equal to skip.
+  // If the stream completes, it will emit an incomplete buffer downstream. In case of an error, it will be dropped.
+
+  // Observable#mapEval is similar to map but it takes a f: A => Task[B] which represents a function with an effectful result that can produce at most one value.
+
+  def load(targetRecords: Observable[TargetRecord], elasticSearchLoad: Seq[TargetRecord] => Task[Unit]): Observable[Int] = {
+    targetRecords.bufferTumbling(5).mapEval { batch =>
+      elasticSearchLoad(batch).map(_ => batch.length)
+    }
+  }
 
   /**
     * Elasticsearch supports saving batches of 5 records.  This is a remote async call so the result is represented
@@ -69,7 +102,7 @@ object ObservableAdventures {
     * Returns the number of records which were saved to elastic search.
     */
   def loadWithRetry(targetRecords: Observable[TargetRecord], elasticSearchLoad: Seq[TargetRecord] => Task[Unit]): Observable[Int] = {
-    load(targetRecords, elasticSearchLoad)
+    load(targetRecords, records => TaskAdventures.retryOnFailure(elasticSearchLoad(records), 5, 100.milliseconds))
   }
 
   /**
@@ -77,7 +110,9 @@ object ObservableAdventures {
     *
     * The final result should be the number of records which were saved to ElasticSearch.
     */
-  def execute(loadedObservable: Observable[Int]): Task[Int] = ???
+  def execute(loadedObservable: Observable[Int]): Task[Int] = {
+    loadedObservable.sumL
+  }
 
   /**
     * Create an Observable from which all records can be read.
@@ -94,7 +129,23 @@ object ObservableAdventures {
     * Observable.++ AND
     * Observable.tailRecM OR Observable.flatMap
     */
-  def readFromPaginatedDatasource(readPage: PageId => Task[PaginatedResult]): Observable[SourceRecord] = ???
+  def readFromPaginatedDatasource(readPage: PageId => Task[PaginatedResult]): Observable[SourceRecord] = {
+    def scanPages(pageId: PageId): Observable[Either[PageId, SourceRecord]] = {
+      Observable.fromTask(readPage(pageId)).flatMap { paginatedResult =>
+        Observable.fromIterable(paginatedResult.results).map(Right(_)) ++
+          continue(paginatedResult.nextPage)
+      }
+    }
+
+    def continue(maybeNextPage: Option[PageId]): Observable[Either[PageId, SourceRecord]] = {
+      maybeNextPage match {
+        case Some(pageId) => Observable(Left(pageId))
+        case None => Observable.empty
+      }
+    }
+
+    Observable.tailRecM(PageId.FirstPage)(scanPages)
+  }
 
   /**
     * Lets say reading a page takes 1 second and loading a batch of records takes 1 second.  If there are 20 pages (each
@@ -104,9 +155,14 @@ object ObservableAdventures {
     *
     * Hint: Read up on asynchronous boundaries in https://monix.io/api/3.0/monix/reactive/Observable.html
     */
+
+  // final def asyncBoundary[B >: A](overflowStrategy: OverflowStrategy[B]): Observable[B]
+  // Forces a buffered asynchronous boundary.
+
   def readTransformAndLoadAndExecute(readPage: PageId => Task[PaginatedResult], elasticSearchLoad: Seq[TargetRecord] => Task[Unit]): Task[Int] = {
     // Note it wouldn't look like this in the prod code, but more a factor of combining our building blocks above.
-    val readObservable = readFromPaginatedDatasource(readPage)
+    // val readObservable = readFromPaginatedDatasource(readPage)
+    val readObservable = readFromPaginatedDatasource(readPage).asyncBoundary(OverflowStrategy.BackPressure(10))
     val transformedObservable = transform(readObservable)
     execute(load(transformedObservable, elasticSearchLoad))
   }

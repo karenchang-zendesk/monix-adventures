@@ -1,7 +1,5 @@
 package adventures.task
 
-import cats.Applicative
-import monix.eval
 import monix.eval.Task
 
 import scala.concurrent.duration.FiniteDuration
@@ -95,9 +93,9 @@ object TaskAdventures {
   // But the effects are not ordered, meaning that there’s potential for parallel execution.
 
   def calculateStringComplexityInParallel(strings: List[String], complexity: String => Task[Int]): Task[Int] = {
-    val tasks: Seq[Task[Int]] = strings.map(complexity)
+    //    val tasks: Seq[Task[Int]] = strings.map(complexity)
 
-    Task.gather(tasks).map(_.sum)
+    Task.parTraverse(strings)(complexity).map(_.sum)
   }
 
   /**
@@ -114,12 +112,14 @@ object TaskAdventures {
     */
   def calculateStringComplexityInParallelAgain(strings: List[String], complexity: String => Task[Int]): Task[Int] = {
     import cats.implicits._
-    implicit def parTaskApplicative: Applicative[eval.Task.Par] = Task.catsParallel.applicative
+    //    implicit def parTaskApplicative: Applicative[eval.Task.Par] = Task.catsParallel.applicative
+    //
+    //    val task: List[Task.Par[Int]] = strings.map(complexity).map(Task.Par.apply)
+    //
+    //    val parTask = task.sequence[Task.Par, Int].map(_.sum)
+    //    Task.Par.unwrap(parTask)
 
-    val task: List[Task.Par[Int]] = strings.map(complexity).map(Task.Par.apply)
-
-    val parTask = task.sequence[Task.Par, Int].map(_.sum)
-    Task.Par.unwrap(parTask)
+    strings.parTraverse(complexity).map(_.sum)
   }
 
   /**
